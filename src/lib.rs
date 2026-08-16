@@ -35,6 +35,19 @@
 //! matched on. `CUSTOM_NAME` (`Videocore` on a set where somebody renamed that port) is
 //! cosmetic and matched on nothing — it moves under a person and would stop matching.
 //!
+//! # The inputs are read, not assumed
+//!
+//! A manifest declares four HDMI ports because it describes a product line; the set this was
+//! written against has three, and the fourth is a jack the pathfinder would happily route a
+//! room through. So `current_inputs` is read on every bind and answered with
+//! [`HostCall::Connections`], which replaces that guess for this one unit.
+//!
+//! Connection ids are **derived from the `CNAME`** — `hdmi2` is always 1002 — rather than from
+//! the order the list arrived in, because a project remembers what an installer wired by that
+//! number. A set that reorders its inputs after a firmware update must not move somebody's
+//! cabling. The manifest's own numbering matches, so anything wired before this existed keeps
+//! working.
+//!
 //! # Pairing is not optional
 //!
 //! Unlike Roku's ECP or Hisense's broker, nothing here answers a single unauthenticated call —
@@ -87,23 +100,14 @@ const PAUSE: Key = (2, 2);
 
 const CURRENT_INPUT: &str = "/menu_native/dynamic/tv_settings/devices/current_input";
 
+/// Every input this set has, with the flags that say which are real — see `report_inputs`.
+const CURRENT_INPUTS: &str = "/menu_native/dynamic/tv_settings/devices/current_inputs";
+
 /// The input a `set_input` is on its way to, held between asking for the hashval and spending
 /// it. See the module doc: the write needs a hashval that is current *at the moment of the
 /// write*, and the switch itself invalidates it — so a cached one authorises exactly one
 /// switch and every one after it is refused, silently, with the TV simply not moving.
 const PENDING_INPUT: &str = "pending_input";
-
-/// This driver's own HDMI connections, matching the manifest's `[[connection]]` blocks:
-/// `(connection id, CNAME to write, NAME to match a reading against)`.
-///
-/// Both spellings, because the API uses each in one direction only — see the module doc. A
-/// write takes `hdmi2`; a read answers `HDMI-2`.
-const HDMI: &[(LocalId, &str, &str)] = &[
-    (1001, "hdmi1", "HDMI-1"),
-    (1002, "hdmi2", "HDMI-2"),
-    (1003, "hdmi3", "HDMI-3"),
-    (1004, "hdmi4", "HDMI-4"),
-];
 
 impl Vizio {
     fn base(inst: &Instance) -> Option<String> {
@@ -132,6 +136,97 @@ impl Vizio {
                 .json(body.to_string())
                 .header("AUTH", token),
         ))
+    }
+
+    /// A stable connection id for one of the TV's inputs, derived from its `CNAME`.
+    ///
+    /// From the name rather than from the order the list arrived in, because a project remembers
+    /// what an installer wired by this number: a set that reports its inputs in a different
+    /// order after a firmware update must not move somebody's cabling. `None` for everything
+    /// that is not a jack — `cast`, `watchfree`, `airplay` are apps, and the `INPUT_TYPE: 2`
+    /// entries (`Player 1`, `Recorder 2`, twelve more) are CEC placeholders for devices that
+    /// have never existed.
+    fn connection_id(cname: &str) -> Option<LocalId> {
+        if let Some(n) = cname.strip_prefix("hdmi") {
+            // 1001, 1002, … — matching the manifest's own numbering, so a set that reports its
+            // inputs keeps the ids anything wired before this landed was using.
+            return n.parse::<LocalId>().ok().filter(|n| (1..=99).contains(n)).map(|n| 1000 + n);
+        }
+        match cname {
+            "comp" => Some(1101),
+            // The antenna jack. `hwtuner` is the same radio reported a second time on this
+            // firmware, always disabled, so it is filtered out before it gets here.
+            "tuner" => Some(1201),
+            _ => None,
+        }
+    }
+
+    /// The `CNAME` a write takes for a connection id — the inverse of [`Self::connection_id`],
+    /// and the reason ids are derived from names rather than positions.
+    fn cname_for(id: u64) -> Option<String> {
+        match id {
+            1001..=1099 => Some(format!("hdmi{}", id - 1000)),
+            1101 => Some("comp".into()),
+            1201 => Some("tuner".into()),
+            _ => None,
+        }
+    }
+
+    /// The connection id a `current_input` reading names. The same mapping again, over the
+    /// display `NAME`s a reading answers with rather than the `CNAME`s a write takes — see the
+    /// module doc on why the API uses each in one direction only.
+    fn id_for_name(name: &str) -> Option<LocalId> {
+        if let Some(n) = name.strip_prefix("HDMI-") {
+            return n.parse::<LocalId>().ok().filter(|n| (1..=99).contains(n)).map(|n| 1000 + n);
+        }
+        match name {
+            "COMP" => Some(1101),
+            "Antenna" => Some(1201),
+            // SMARTCAST, WatchFree+, AirPlay: the set's own apps, not jacks anything is wired to.
+            _ => None,
+        }
+    }
+
+    /// What kind of cable an input takes, for the pathfinder's own vocabulary.
+    fn signal_class(cname: &str) -> &'static str {
+        if cname.starts_with("hdmi") {
+            "HDMI"
+        } else if cname == "comp" {
+            "COMPOSITE"
+        } else {
+            "RF_UHF_VHF"
+        }
+    }
+
+    /// The inputs this set actually has, from a `current_inputs` reading.
+    ///
+    /// The manifest declares four HDMI ports because a manifest describes a product line; this
+    /// V-series has three, and the fourth is a jack the pathfinder would otherwise happily route
+    /// a room through. Only inputs the TV marks both `ENABLED` and `VISIBLE` count — the rest
+    /// are placeholders it carries for hardware nobody owns.
+    fn report_inputs(value: &Value) -> Option<HostCall> {
+        let inputs = value.as_array()?;
+        let connections: Vec<ConnectionDecl> = inputs
+            .iter()
+            .filter(|i| {
+                i.get("ENABLED").and_then(Value::as_bool) == Some(true)
+                    && i.get("VISIBLE").and_then(Value::as_bool) == Some(true)
+            })
+            .filter_map(|i| {
+                let cname = i.get("CNAME").and_then(Value::as_str)?;
+                Some(ConnectionDecl {
+                    id: Self::connection_id(cname)?,
+                    proxy: TV,
+                    dir: Direction::Consumer,
+                    class: Self::signal_class(cname).into(),
+                    // The stock name, not `CUSTOM_NAME`: what somebody renamed an input to is
+                    // theirs to change, and a connection's name is what a project was wired
+                    // against.
+                    name: i.get("NAME").and_then(Value::as_str)?.to_string(),
+                })
+            })
+            .collect();
+        Some(HostCall::Connections { connections })
     }
 
     fn send_key(inst: &Instance, (codeset, code): Key) -> Option<HostCall> {
@@ -215,8 +310,7 @@ impl DriverModule for Vizio {
                 let Some(conn) = args.get("connection").and_then(Value::as_u64) else {
                     return vec![HostCall::warn("vizio: set_input needs a connection")];
                 };
-                let Some((_, cname, _)) = HDMI.iter().find(|(id, _, _)| u64::from(*id) == conn)
-                else {
+                let Some(cname) = Self::cname_for(conn) else {
                     return vec![HostCall::warn(format!("vizio: no such connection {conn}"))];
                 };
                 // Ask, then write — see `PENDING_INPUT`. Writing from a cached hashval works
@@ -276,6 +370,12 @@ impl DriverModule for Vizio {
             return Vec::new();
         };
 
+        // An array: the input list. Told apart from the two scalars below by shape, like every
+        // other reply here — see the module doc.
+        if value.is_array() {
+            return Self::report_inputs(value).into_iter().collect();
+        }
+
         // A bare number: `power_mode`.
         if let Some(on) = value.as_i64().map(|v| v != 0) {
             let mut a = Args::new();
@@ -307,7 +407,7 @@ impl DriverModule for Vizio {
                     // The CNAME, not the NAME — see the module doc.
                     json!({ "REQUEST": "MODIFY", "VALUE": cname, "HASHVAL": hashval }),
                 ));
-                if let Some((id, _, _)) = HDMI.iter().find(|(_, c, _)| *c == cname) {
+                if let Some(id) = Self::connection_id(cname) {
                     let mut a = Args::new();
                     a.insert("connection".into(), json!(id));
                     out.push(HostCall::notify(TV, "input_changed", a));
@@ -315,7 +415,7 @@ impl DriverModule for Vizio {
                 return out;
             }
 
-            if let Some((id, _, _)) = HDMI.iter().find(|(_, _, n)| n.eq_ignore_ascii_case(name)) {
+            if let Some(id) = Self::id_for_name(name) {
                 let mut a = Args::new();
                 a.insert("connection".into(), json!(id));
                 return vec![HostCall::notify(TV, "input_changed", a)];
@@ -333,6 +433,10 @@ impl DriverModule for Vizio {
         out.push(HostCall::notify(MEDIA, "online_changed", a));
         out.extend(Self::get(inst, "/state/device/power_mode"));
         out.extend(Self::get(inst, CURRENT_INPUT));
+        // Which inputs this particular set has, replacing the manifest's product-line guess.
+        // Asked on every bind rather than once: somebody can enable or hide an input in the
+        // TV's own settings, and the manifest cannot know that either.
+        out.extend(Self::get(inst, CURRENT_INPUTS));
         out
     }
 }
@@ -662,6 +766,63 @@ mod tests {
         let mut a = Args::new();
         a.insert("body".into(), json!({ "STATUS": { "RESULT": "SUCCESS" } }));
         assert!(driver.on_event(&mut inst, 0, "http_response", &a).is_empty());
+    }
+    /// The real `current_inputs` payload from a V505-H19, trimmed to the entries that matter.
+    /// Its manifest declares four HDMI ports; this set has three, and the fourth is a jack the
+    /// pathfinder would otherwise route a room through.
+    #[test]
+    fn only_real_jacks_are_reported_as_connections() {
+        let driver = Vizio;
+        let mut inst = Instance::default();
+        let mut a = Args::new();
+        a.insert(
+            "body".into(),
+            json!({ "ITEMS": [{ "CNAME": "current_inputs", "VALUE": [
+                { "CNAME": "hwtuner",  "NAME": "tuner",      "ENABLED": false, "VISIBLE": false },
+                { "CNAME": "comp",     "NAME": "COMP",       "ENABLED": true,  "VISIBLE": true  },
+                { "CNAME": "hdmi1",    "NAME": "HDMI-1",     "ENABLED": true,  "VISIBLE": true  },
+                { "CNAME": "hdmi2",    "NAME": "HDMI-2",     "ENABLED": true,  "VISIBLE": true  },
+                { "CNAME": "hdmi3",    "NAME": "HDMI-3",     "ENABLED": true,  "VISIBLE": true  },
+                { "CNAME": "usb",      "NAME": "usb",        "ENABLED": false, "VISIBLE": false },
+                { "CNAME": "cast",     "NAME": "SMARTCAST",  "ENABLED": true,  "VISIBLE": true  },
+                { "CNAME": "watchfree","NAME": "WatchFree+", "ENABLED": true,  "VISIBLE": true  },
+                { "CNAME": "Player 1", "NAME": "Player 1",   "ENABLED": false, "VISIBLE": false },
+                { "CNAME": "airplay",  "NAME": "AirPlay",    "ENABLED": true,  "VISIBLE": true  },
+                { "CNAME": "tuner",    "NAME": "Antenna",    "ENABLED": true,  "VISIBLE": true  }
+            ] }] }),
+        );
+        let calls = driver.on_event(&mut inst, 0, "http_response", &a);
+        let [HostCall::Connections { connections }] = calls.as_slice() else {
+            panic!("expected one Connections call, got {calls:?}");
+        };
+
+        let ids: Vec<LocalId> = connections.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1101, 1001, 1002, 1003, 1201], "three HDMI, composite, antenna");
+        assert!(
+            !ids.contains(&1004),
+            "the manifest's fourth HDMI is exactly the phantom this exists to remove"
+        );
+
+        // Apps and CEC placeholders are not jacks, and a disabled duplicate of the tuner is not
+        // a second antenna socket.
+        assert_eq!(connections.len(), 5);
+        assert!(connections.iter().all(|c| c.dir == Direction::Consumer && c.proxy == TV));
+        let hdmi2 = connections.iter().find(|c| c.id == 1002).unwrap();
+        assert_eq!(hdmi2.class, "HDMI");
+        assert_eq!(hdmi2.name, "HDMI-2");
+        assert_eq!(connections.iter().find(|c| c.id == 1201).unwrap().class, "RF_UHF_VHF");
+    }
+
+    /// Ids come from the name, so a set that reports its inputs in a different order after a
+    /// firmware update does not renumber somebody's cabling.
+    #[test]
+    fn connection_ids_do_not_depend_on_the_order_inputs_arrive_in() {
+        assert_eq!(Vizio::connection_id("hdmi2"), Some(1002));
+        assert_eq!(Vizio::cname_for(1002).as_deref(), Some("hdmi2"));
+        assert_eq!(Vizio::id_for_name("HDMI-2"), Some(1002));
+        // Apps have no id in either direction.
+        assert_eq!(Vizio::connection_id("cast"), None);
+        assert_eq!(Vizio::id_for_name("SMARTCAST"), None);
     }
 }
 
