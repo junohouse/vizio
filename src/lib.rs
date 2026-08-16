@@ -1,0 +1,668 @@
+//! VIZIO SmartCast TVs, over the local HTTPS API built into the set, port 7345 (older
+//! firmware: 9000). Self-signed certificate, wrong CN — core accepts it for a bare IP the same
+//! way it accepts every other LAN bridge's; see `Tls::LOCAL` in `core`.
+//!
+//! ```text
+//!   PUT  /pairing/start   {DEVICE_ID,DEVICE_NAME}                unauthenticated, shows a PIN
+//!   PUT  /pairing/pair    {DEVICE_ID,CHALLENGE_TYPE,
+//!                          PAIRING_REQ_TOKEN,RESPONSE_VALUE}     unauthenticated, returns AUTH_TOKEN
+//!   PUT  /key_command/    {KEYLIST:[{CODESET,CODE,ACTION}]}      header AUTH: <token>
+//!   GET  /state/device/power_mode                                header AUTH: <token>
+//!   GET  /menu_native/dynamic/tv_settings/devices/current_input  header AUTH: <token>
+//!   PUT  /menu_native/dynamic/tv_settings/devices/current_input  {REQUEST,VALUE,HASHVAL}
+//! ```
+//!
+//! Every reply is `{"STATUS":{...}, ...}`, and nothing in `on_event`'s arguments says which
+//! request it answers — the http layer does not carry that across, same as Roku's. So replies
+//! are told apart by shape, the same choice `hisense` makes for its MQTT messages: a bare
+//! number in `ITEMS[0].VALUE` is a power reading, a string is the current input's name. A
+//! `key_command` reply carries no `ITEMS` at all — ordinarily nothing to read there, except
+//! mid-seek (see below), where its absence is itself the signal.
+//!
+//! # `set_input` writes the CNAME, not the name
+//!
+//! `PUT .../current_input {REQUEST:"MODIFY",VALUE:<input>,HASHVAL:<hash>}` takes the input's
+//! **`CNAME`** — `hdmi2`, lowercase, no hyphen — and answers `FAILURE` for its display `NAME`
+//! (`HDMI-2`), which is what the reference Python client (`pyvizio`) sends and what every
+//! write here did until it was checked against real hardware. The two are easy to confuse
+//! because `.../devices/name_input` reports both, and the failure looks exactly like the
+//! open "cannot change input" firmware bug that client's users report — silent, with a
+//! correctly-formed request. Verified against a real set: `hdmi2` switches it, `HDMI-2` does
+//! not, and nothing else about the request differs.
+//!
+//! So there are three names per input and each has one job. `CNAME` (`hdmi2`) is what a write
+//! takes. `NAME` (`HDMI-2`) is what `current_input` reads back, so it is what a reply is
+//! matched on. `CUSTOM_NAME` (`Videocore` on a set where somebody renamed that port) is
+//! cosmetic and matched on nothing — it moves under a person and would stop matching.
+//!
+//! # Pairing is not optional
+//!
+//! Unlike Roku's ECP or Hisense's broker, nothing here answers a single unauthenticated call —
+//! `/pairing/start` and `/pairing/pair` are the only two that do. `AUTH_TOKEN` is what every
+//! other request presents in an `AUTH` header, and it is issued once, by pairing, not
+//! discovered or guessed.
+//!
+//! # No app launching
+//!
+//! There is no local endpoint that lists installed apps — VIZIO's own remote gets that from a
+//! cloud catalog keyed by ids this driver has no verified copy of. Left out rather than guessed.
+
+use driver_sdk::*;
+use driver_sdk::Value;
+
+#[derive(Default)]
+pub struct Vizio;
+
+/// Fixed, because nothing about pairing needs this to vary — the TV tracks one paired identity
+/// per string. A real client (the SmartCast Mobile app) does the same with its own constant.
+const DEVICE_ID: &str = "juno";
+const DEVICE_NAME: &str = "Juno";
+
+const MEDIA: LocalId = 1;
+const TV: LocalId = 2;
+
+/// A key press: (codeset, code). SmartCast's remote is a fixed table of these rather than
+/// named keys — see `drivers/vizio/README.md` and the module doc for where this table came
+/// from (pyvizio's own, field-tested against real hardware).
+type Key = (u32, u32);
+const POW_ON: Key = (11, 1);
+const POW_OFF: Key = (11, 0);
+const POW_TOGGLE: Key = (11, 2);
+const VOL_UP: Key = (5, 1);
+const VOL_DOWN: Key = (5, 0);
+const MUTE_ON: Key = (5, 3);
+const MUTE_OFF: Key = (5, 2);
+const MUTE_TOGGLE: Key = (5, 4);
+const INPUT_NEXT: Key = (7, 1);
+const UP: Key = (3, 8);
+const DOWN: Key = (3, 0);
+const LEFT: Key = (3, 1);
+const RIGHT: Key = (3, 7);
+const OK: Key = (3, 2);
+const MENU: Key = (4, 8);
+const BACK: Key = (4, 0);
+const HOME: Key = (4, 15);
+const PLAY: Key = (2, 3);
+const PAUSE: Key = (2, 2);
+
+const CURRENT_INPUT: &str = "/menu_native/dynamic/tv_settings/devices/current_input";
+
+/// The input a `set_input` is on its way to, held between asking for the hashval and spending
+/// it. See the module doc: the write needs a hashval that is current *at the moment of the
+/// write*, and the switch itself invalidates it — so a cached one authorises exactly one
+/// switch and every one after it is refused, silently, with the TV simply not moving.
+const PENDING_INPUT: &str = "pending_input";
+
+/// This driver's own HDMI connections, matching the manifest's `[[connection]]` blocks:
+/// `(connection id, CNAME to write, NAME to match a reading against)`.
+///
+/// Both spellings, because the API uses each in one direction only — see the module doc. A
+/// write takes `hdmi2`; a read answers `HDMI-2`.
+const HDMI: &[(LocalId, &str, &str)] = &[
+    (1001, "hdmi1", "HDMI-1"),
+    (1002, "hdmi2", "HDMI-2"),
+    (1003, "hdmi3", "HDMI-3"),
+    (1004, "hdmi4", "HDMI-4"),
+];
+
+impl Vizio {
+    fn base(inst: &Instance) -> Option<String> {
+        let addr = inst.property("Address").as_str()?.trim().to_string();
+        if addr.is_empty() {
+            return None;
+        }
+        Some(format!("https://{addr}:7345"))
+    }
+
+    fn auth(inst: &Instance) -> Option<String> {
+        inst.property("Auth Token").as_str().filter(|s| !s.is_empty()).map(str::to_string)
+    }
+
+    fn get(inst: &Instance, path: &str) -> Option<HostCall> {
+        let token = Self::auth(inst)?;
+        Some(HostCall::Http(
+            HttpRequest::new("GET", format!("{}{path}", Self::base(inst)?)).header("AUTH", token),
+        ))
+    }
+
+    fn put(inst: &Instance, path: &str, body: Value) -> Option<HostCall> {
+        let token = Self::auth(inst)?;
+        Some(HostCall::Http(
+            HttpRequest::new("PUT", format!("{}{path}", Self::base(inst)?))
+                .json(body.to_string())
+                .header("AUTH", token),
+        ))
+    }
+
+    fn send_key(inst: &Instance, (codeset, code): Key) -> Option<HostCall> {
+        Self::put(
+            inst,
+            "/key_command/",
+            json!({ "KEYLIST": [{ "CODESET": codeset, "CODE": code, "ACTION": "KEYPRESS" }] }),
+        )
+    }
+
+}
+
+impl DriverModule for Vizio {
+    fn discover(&self, _driver_id: &str, state: &Value, input: &Args) -> (SetupStep, Value) {
+        self.flow(state, input)
+    }
+
+    fn setup(&self, _driver_id: &str, state: &Value, input: &Args) -> (SetupStep, Value) {
+        self.flow(state, input)
+    }
+
+    fn on_command(
+        &self,
+        inst: &mut Instance,
+        proxy: LocalId,
+        cmd: &str,
+        args: &Args,
+    ) -> Vec<HostCall> {
+        if Self::base(inst).is_none() {
+            return vec![HostCall::warn("vizio: set the Address on this device first")];
+        }
+        if Self::auth(inst).is_none() {
+            return vec![HostCall::warn("vizio: this TV is not paired yet — run its setup flow")];
+        }
+
+        let key = match (proxy, cmd) {
+            (_, "play") => PLAY,
+            (_, "pause") => PAUSE,
+            (_, "stop") => PAUSE, // no stop key on this remote; pause is the closest real one
+
+            (TV, "on") => POW_ON,
+            (TV, "off") => POW_OFF,
+            (TV, "power_toggle") => POW_TOGGLE,
+            (TV, "volume_up") => VOL_UP,
+            (TV, "volume_down") => VOL_DOWN,
+            (TV, "mute_toggle") => MUTE_TOGGLE,
+            (TV, "set_mute") => {
+                let on = args.get("mute").and_then(Value::as_bool).unwrap_or(false);
+                let mut a = Args::new();
+                a.insert("mute".into(), json!(on));
+                let mut out = vec![];
+                out.extend(Self::send_key(inst, if on { MUTE_ON } else { MUTE_OFF }));
+                out.push(HostCall::notify(TV, "mute_changed", a));
+                return out;
+            }
+
+            (_, "dpad") => {
+                let Some(k) = args.get("key").and_then(Value::as_str) else {
+                    return vec![HostCall::warn("vizio: dpad needs a key")];
+                };
+                match k {
+                    "up" => UP,
+                    "down" => DOWN,
+                    "left" => LEFT,
+                    "right" => RIGHT,
+                    "select" => OK,
+                    "back" => BACK,
+                    "home" => HOME,
+                    "menu" => MENU,
+                    other => return vec![HostCall::warn(format!("vizio: no key `{other}`"))],
+                }
+            }
+
+            (TV, "pulse_input") => {
+                let mut out = vec![];
+                out.extend(Self::send_key(inst, INPUT_NEXT));
+                return out;
+            }
+
+            (TV, "set_input") => {
+                let Some(conn) = args.get("connection").and_then(Value::as_u64) else {
+                    return vec![HostCall::warn("vizio: set_input needs a connection")];
+                };
+                let Some((_, cname, _)) = HDMI.iter().find(|(id, _, _)| u64::from(*id) == conn)
+                else {
+                    return vec![HostCall::warn(format!("vizio: no such connection {conn}"))];
+                };
+                // Ask, then write — see `PENDING_INPUT`. Writing from a cached hashval works
+                // exactly once and then silently stops, because the switch invalidates the
+                // hashval that authorised it.
+                inst.scratch.insert(PENDING_INPUT.into(), json!(cname));
+                return Self::get(inst, CURRENT_INPUT).into_iter().collect();
+            }
+
+            (_, other) => return vec![HostCall::warn(format!("vizio: unhandled `{other}`"))],
+        };
+
+        let mut out = Vec::new();
+        out.extend(Self::send_key(inst, key));
+        match cmd {
+            "play" => {
+                let mut a = Args::new();
+                a.insert("state".into(), json!("playing"));
+                out.push(HostCall::notify(MEDIA, "transport_changed", a));
+            }
+            "pause" | "stop" => {
+                let mut a = Args::new();
+                a.insert("state".into(), json!(if cmd == "pause" { "paused" } else { "stopped" }));
+                out.push(HostCall::notify(MEDIA, "transport_changed", a));
+            }
+            "on" | "off" => {
+                let mut a = Args::new();
+                a.insert("on".into(), json!(cmd == "on"));
+                out.push(HostCall::notify(TV, "power_changed", a));
+            }
+            // power_toggle, volume_up/down, mute_toggle: no optimistic notify. Which way a
+            // toggle just went, or where the level landed, is a guess this driver is not in a
+            // better position to make than reading the TV back.
+            _ => {}
+        }
+        out
+    }
+
+    fn on_event(
+        &self,
+        inst: &mut Instance,
+        _control: LocalId,
+        note: &str,
+        args: &Args,
+    ) -> Vec<HostCall> {
+        if note != "http_response" {
+            return Vec::new();
+        }
+        let Some(body) = args.get("body") else {
+            return Vec::new();
+        };
+        let Some(item) = body.get("ITEMS").and_then(Value::as_array).and_then(|a| a.first())
+        else {
+            return Vec::new(); // a key_command reply, or nothing this driver reads
+        };
+        let Some(value) = item.get("VALUE") else {
+            return Vec::new();
+        };
+
+        // A bare number: `power_mode`.
+        if let Some(on) = value.as_i64().map(|v| v != 0) {
+            let mut a = Args::new();
+            a.insert("on".into(), json!(on));
+            return vec![HostCall::notify(TV, "power_changed", a)];
+        }
+
+        // A bare string: `current_input`, matched on the NAME the TV reads back rather than the
+        // CNAME a write takes — see the module doc.
+        if let Some(name) = value.as_str() {
+            let hashval = item.get("HASHVAL").and_then(Value::as_i64);
+            if let Some(hashval) = hashval {
+                inst.scratch.insert("current_input_hashval".into(), json!(hashval));
+            }
+
+            // A switch was waiting on exactly this. Spend the hashval immediately — anything
+            // that happens in between is what makes it stale.
+            if let Some(cname) = inst.scratch.remove(PENDING_INPUT) {
+                let (Some(cname), Some(hashval)) = (cname.as_str(), hashval) else {
+                    return vec![HostCall::warn(
+                        "vizio: the TV did not say which input it is on, so there is nothing to \
+                         switch from",
+                    )];
+                };
+                let mut out = Vec::new();
+                out.extend(Self::put(
+                    inst,
+                    CURRENT_INPUT,
+                    // The CNAME, not the NAME — see the module doc.
+                    json!({ "REQUEST": "MODIFY", "VALUE": cname, "HASHVAL": hashval }),
+                ));
+                if let Some((id, _, _)) = HDMI.iter().find(|(_, c, _)| *c == cname) {
+                    let mut a = Args::new();
+                    a.insert("connection".into(), json!(id));
+                    out.push(HostCall::notify(TV, "input_changed", a));
+                }
+                return out;
+            }
+
+            if let Some((id, _, _)) = HDMI.iter().find(|(_, _, n)| n.eq_ignore_ascii_case(name)) {
+                let mut a = Args::new();
+                a.insert("connection".into(), json!(id));
+                return vec![HostCall::notify(TV, "input_changed", a)];
+            }
+            return Vec::new();
+        }
+
+        Vec::new()
+    }
+
+    fn on_bind(&self, inst: &mut Instance) -> Vec<HostCall> {
+        let mut out = Vec::new();
+        let mut a = Args::new();
+        a.insert("online".into(), json!(true));
+        out.push(HostCall::notify(MEDIA, "online_changed", a));
+        out.extend(Self::get(inst, "/state/device/power_mode"));
+        out.extend(Self::get(inst, CURRENT_INPUT));
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Setup flow — pairing
+// ---------------------------------------------------------------------------------------
+
+impl Vizio {
+    fn flow(&self, state: &Value, input: &Args) -> (SetupStep, Value) {
+        let phase = state.get("phase").and_then(Value::as_str).unwrap_or("start");
+        match phase {
+            "start" => (
+                SetupStep::Form {
+                    title: "Add a VIZIO TV".into(),
+                    body: "Its address is on the TV: Settings → Network → Network Connection. \
+                           The next screen will ask for a code the TV shows once this reaches \
+                           it, so leave the TV on and pointed at that screen."
+                        .into(),
+                    fields: vec![Field {
+                        name: "address".into(),
+                        label: "Address".into(),
+                        kind: "string".into(),
+                        help: "for example 192.168.1.42".into(),
+                        default: None,
+                        options: Vec::new(),
+                        required: true,
+                    }],
+                },
+                json!({ "phase": "entered" }),
+            ),
+
+            "entered" => {
+                let address =
+                    input.get("address").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+                if address.is_empty() {
+                    return (
+                        SetupStep::Failed { reason: "an address is needed".into() },
+                        Value::Null,
+                    );
+                }
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "PUT",
+                            format!("https://{address}:7345/pairing/start"),
+                        )
+                        .json(json!({ "DEVICE_ID": DEVICE_ID, "DEVICE_NAME": DEVICE_NAME }).to_string()),
+                        note: "asking the TV to show a pairing code".into(),
+                    },
+                    json!({ "phase": "started", "address": address }),
+                )
+            }
+
+            "started" => {
+                let address = state.get("address").and_then(Value::as_str).unwrap_or_default().to_string();
+                let response = input.get("response").cloned().unwrap_or(Value::Null);
+                let item = response.get("ITEM");
+                let (Some(token), Some(challenge)) = (
+                    item.and_then(|i| i.get("PAIRING_REQ_TOKEN")).and_then(Value::as_i64),
+                    item.and_then(|i| i.get("CHALLENGE_TYPE")).and_then(Value::as_i64),
+                ) else {
+                    return (
+                        SetupStep::Failed {
+                            reason: format!(
+                                "{address} did not answer as a VIZIO SmartCast TV. Check the \
+                                 address under Settings → Network → Network Connection."
+                            ),
+                        },
+                        Value::Null,
+                    );
+                };
+                (
+                    SetupStep::Form {
+                        title: "Enter the code shown on the TV".into(),
+                        body: "A 4-digit code should now be on screen.".into(),
+                        fields: vec![Field {
+                            name: "pin".into(),
+                            label: "Code".into(),
+                            kind: "string".into(),
+                            help: String::new(),
+                            default: None,
+                            options: Vec::new(),
+                            required: true,
+                        }],
+                    },
+                    json!({
+                        "phase": "coded", "address": address,
+                        "req_token": token, "challenge_type": challenge,
+                    }),
+                )
+            }
+
+            "coded" => {
+                let address = state.get("address").and_then(Value::as_str).unwrap_or_default().to_string();
+                let req_token = state.get("req_token").and_then(Value::as_i64).unwrap_or(0);
+                let challenge = state.get("challenge_type").and_then(Value::as_i64).unwrap_or(0);
+                let pin = input.get("pin").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+                if pin.is_empty() {
+                    return (SetupStep::Failed { reason: "a code is needed".into() }, Value::Null);
+                }
+                (
+                    SetupStep::Fetch {
+                        request: HttpRequest::new(
+                            "PUT",
+                            format!("https://{address}:7345/pairing/pair"),
+                        )
+                        .json(
+                            json!({
+                                "DEVICE_ID": DEVICE_ID,
+                                "CHALLENGE_TYPE": challenge,
+                                "PAIRING_REQ_TOKEN": req_token,
+                                "RESPONSE_VALUE": pin,
+                            })
+                            .to_string(),
+                        ),
+                        note: "checking the code".into(),
+                    },
+                    json!({ "phase": "paired", "address": address }),
+                )
+            }
+
+            "paired" => {
+                let address = state.get("address").and_then(Value::as_str).unwrap_or_default().to_string();
+                let response = input.get("response").cloned().unwrap_or(Value::Null);
+                let Some(token) = response.get("ITEM").and_then(|i| i.get("AUTH_TOKEN")).and_then(Value::as_str)
+                else {
+                    return (
+                        SetupStep::Failed {
+                            reason: "that code was not accepted. Start over and check the TV \
+                                     screen for a fresh one."
+                                .into(),
+                        },
+                        Value::Null,
+                    );
+                };
+                (
+                    SetupStep::Choose {
+                        title: "Add this TV".into(),
+                        body: "Paired.".into(),
+                        options: vec![Candidate {
+                            label: format!("VIZIO TV ({address})"),
+                            kind: "VIZIO TV".into(),
+                            driver_id: "vizio.tv".into(),
+                            properties: [
+                                ("Address".to_string(), json!(address)),
+                                ("Auth Token".to_string(), json!(token)),
+                            ]
+                            .into_iter()
+                            .collect(),
+                            verified: "paired and holding an auth token".into(),
+                            ..Default::default()
+                        }],
+                        multiple: false,
+                    },
+                    json!({ "phase": "chosen" }),
+                )
+            }
+
+            "chosen" => {
+                let devices: Vec<Candidate> = input
+                    .get("chosen")
+                    .and_then(|c| driver_sdk::serde_json::from_value(c.clone()).ok())
+                    .unwrap_or_default();
+                (SetupStep::done(devices), Value::Null)
+            }
+
+            other => (
+                SetupStep::Failed { reason: format!("unknown setup phase `{other}`") },
+                Value::Null,
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_refused_before_pairing_rather_than_sent_unauthenticated() {
+        let driver = Vizio;
+        let mut inst = Instance::default();
+        inst.properties.insert("Address".into(), json!("10.0.0.5"));
+        let calls = driver.on_command(&mut inst, TV, "on", &Args::new());
+        assert!(
+            matches!(calls.as_slice(), [HostCall::Log { level, .. }] if level == "warn"),
+            "expected a warning, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn power_on_sends_the_documented_key_code() {
+        let driver = Vizio;
+        let mut inst = Instance::default();
+        inst.properties.insert("Address".into(), json!("10.0.0.5"));
+        inst.properties.insert("Auth Token".into(), json!("tok"));
+        let calls = driver.on_command(&mut inst, TV, "on", &Args::new());
+        let [HostCall::Http(req), HostCall::Notify { .. }] = calls.as_slice() else {
+            panic!("expected an http call and a notify, got {calls:?}");
+        };
+        assert!(req.url.ends_with("/key_command/"));
+        assert!(req.headers.iter().any(|(k, v)| k == "AUTH" && v == "tok"));
+        let body: Value = serde_json::from_str(req.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["KEYLIST"][0]["CODESET"], 11);
+        assert_eq!(body["KEYLIST"][0]["CODE"], 1);
+    }
+
+    fn current_input(name: &str, hashval: i64) -> Args {
+        let mut a = Args::new();
+        a.insert(
+            "body".into(),
+            json!({ "ITEMS": [{ "CNAME": "current_input", "VALUE": name, "HASHVAL": hashval }] }),
+        );
+        a
+    }
+
+    fn paired() -> Instance {
+        let mut inst = Instance::default();
+        inst.properties.insert("Address".into(), json!("10.0.0.5"));
+        inst.properties.insert("Auth Token".into(), json!("tok"));
+        inst
+    }
+
+    /// The whole of `set_input`, both halves. It asks first and writes from the answer, and the
+    /// write takes the lowercase `CNAME` — a real set refuses the display `NAME` with
+    /// `FAILURE`. Both are the kind of thing that reads like a typo and would be "corrected"
+    /// straight back into a bug; both were found against real hardware.
+    #[test]
+    fn set_input_asks_for_a_fresh_hashval_then_writes_the_cname() {
+        let driver = Vizio;
+        let mut inst = paired();
+
+        let mut a = Args::new();
+        a.insert("connection".into(), json!(1002u64));
+        let calls = driver.on_command(&mut inst, TV, "set_input", &a);
+        let [HostCall::Http(ask)] = calls.as_slice() else {
+            panic!("expected one read and no write yet, got {calls:?}");
+        };
+        assert_eq!(ask.method, "GET");
+        assert!(ask.url.ends_with("/current_input"));
+
+        // The answer carries the hashval that authorises the write.
+        let calls = driver.on_event(&mut inst, 0, "http_response", &current_input("SMARTCAST", 42));
+        let [HostCall::Http(write), HostCall::Notify { name, args, .. }] = calls.as_slice() else {
+            panic!("expected the write and a notify, got {calls:?}");
+        };
+        assert_eq!(write.method, "PUT");
+        let body: Value = serde_json::from_str(write.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["VALUE"], "hdmi2", "a write takes the CNAME");
+        assert_eq!(body["HASHVAL"], 42, "and the hashval that just came back");
+        assert_eq!(name, "input_changed");
+        assert_eq!(args.get("connection").unwrap(), &json!(1002));
+        assert!(!inst.scratch.contains_key(PENDING_INPUT), "the switch is done");
+    }
+
+    /// Switching twice in a row. The hashval is invalidated by the switch it authorises, so a
+    /// driver that reuses one has its second write refused and the TV simply does not move —
+    /// silently, since nothing here reads `STATUS`. Caught live: the first switch worked and
+    /// every one after it did nothing.
+    #[test]
+    fn a_second_switch_asks_again_rather_than_reusing_a_spent_hashval() {
+        let driver = Vizio;
+        let mut inst = paired();
+
+        for (conn, hashval, cname) in [(1002u64, 42i64, "hdmi2"), (1003, 77, "hdmi3")] {
+            let mut a = Args::new();
+            a.insert("connection".into(), json!(conn));
+            let calls = driver.on_command(&mut inst, TV, "set_input", &a);
+            assert!(
+                matches!(calls.as_slice(), [HostCall::Http(r)] if r.method == "GET"),
+                "every switch starts by asking, got {calls:?}"
+            );
+            let calls =
+                driver.on_event(&mut inst, 0, "http_response", &current_input("SMARTCAST", hashval));
+            let [HostCall::Http(write), ..] = calls.as_slice() else {
+                panic!("expected a write, got {calls:?}");
+            };
+            let body: Value = serde_json::from_str(write.body.as_deref().unwrap()).unwrap();
+            assert_eq!(body["HASHVAL"], hashval, "each write spends the hashval just read");
+            assert_eq!(body["VALUE"], cname);
+        }
+    }
+
+    /// The other direction: a reading answers the display `NAME`, so that is what an unprompted
+    /// reply is matched on. Matching a reading against the CNAME would report nothing, ever.
+    #[test]
+    fn a_reading_nobody_asked_for_is_matched_on_the_display_name() {
+        let driver = Vizio;
+        let mut inst = Instance::default();
+        let calls = driver.on_event(&mut inst, 0, "http_response", &current_input("HDMI-2", 99));
+        let [HostCall::Notify { name, args, .. }] = calls.as_slice() else {
+            panic!("expected input_changed, got {calls:?}");
+        };
+        assert_eq!(name, "input_changed");
+        assert_eq!(args.get("connection").unwrap(), &json!(1002));
+    }
+
+    /// An input somebody renamed in the TV's own settings still answers its stock `NAME` on a
+    /// reading — `CUSTOM_NAME` is cosmetic and matched on nothing.
+    #[test]
+    fn a_renamed_input_still_matches_on_its_stock_name() {
+        let driver = Vizio;
+        let mut inst = Instance::default();
+        let calls = driver.on_event(&mut inst, 0, "http_response", &current_input("Videocore", 1));
+        assert!(calls.is_empty(), "a custom name matches nothing, got {calls:?}");
+    }
+
+    #[test]
+    fn a_power_reading_becomes_a_power_changed_notification() {
+        let driver = Vizio;
+        let mut inst = Instance::default();
+        let mut a = Args::new();
+        a.insert("body".into(), json!({ "ITEMS": [{ "CNAME": "power_mode", "VALUE": 1 }] }));
+        let calls = driver.on_event(&mut inst, 0, "http_response", &a);
+        let [HostCall::Notify { name, args, .. }] = calls.as_slice() else {
+            panic!("expected one power_changed notification, got {calls:?}");
+        };
+        assert_eq!(name, "power_changed");
+        assert_eq!(args.get("on").unwrap(), &json!(true));
+    }
+
+    #[test]
+    fn a_key_command_reply_carries_no_items_and_is_quietly_ignored() {
+        let driver = Vizio;
+        let mut inst = Instance::default();
+        let mut a = Args::new();
+        a.insert("body".into(), json!({ "STATUS": { "RESULT": "SUCCESS" } }));
+        assert!(driver.on_event(&mut inst, 0, "http_response", &a).is_empty());
+    }
+}
+
+export_driver!(Vizio);

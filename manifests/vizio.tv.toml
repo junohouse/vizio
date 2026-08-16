@@ -1,0 +1,74 @@
+[driver]
+id = "vizio.tv"
+name = "VIZIO TV"
+manufacturer = "VIZIO"
+version = "1.0.0"
+runtime = "wasm"
+primary = true
+
+[[proxy]]
+id = 1
+type = "media_player"
+primary = true
+name = "VIZIO"
+# No has_apps: SmartCast's local API has no endpoint that lists installed apps — only a cloud
+# catalog VIZIO itself queries for the official remote. Guessing app ids here would mean
+# `launch_app` sometimes opening nothing, which is worse than not offering it.
+capabilities = { has_transport = true, has_dpad = true, is_video_source = true, is_audio_source = true }
+
+[[proxy]]
+id = 2
+type = "tv"
+name = "Screen"
+# Unlike a Hisense over its MQTT broker, SmartCast draws POW_ON and POW_OFF as two distinct key
+# codes, and current_input is set by name rather than cycled — both genuinely discrete here.
+capabilities = { has_discrete_power = true, has_discrete_input = true, has_volume = true, has_discrete_mute = true }
+
+[[connection]]
+id = 1001
+proxy = 2
+dir = "consumer"
+class = "HDMI"
+name = "HDMI 1"
+
+[[connection]]
+id = 1002
+proxy = 2
+dir = "consumer"
+class = "HDMI"
+name = "HDMI 2"
+
+[[connection]]
+id = 1003
+proxy = 2
+dir = "consumer"
+class = "HDMI"
+name = "HDMI 3"
+
+[[connection]]
+id = 1004
+proxy = 2
+dir = "consumer"
+class = "HDMI"
+name = "HDMI 4"
+
+[[transport]]
+kind = "network"
+port = 7345
+
+[[property]]
+name = "Address"
+type = "string"
+required = true
+tooltip = "IP address of the TV. Settings → Network → Network Connection shows it."
+
+[[property]]
+name = "Auth Token"
+type = "password"
+tooltip = "Issued by pairing — do not edit by hand."
+
+# No [discovery]: DIAL SSDP (urn:dial-multiscreen-org:device:dial:1) and mDNS
+# (_viziocast._tcp) both exist for this, but the SSDP type is shared with every DIAL-capable
+# TV — Roku included — and telling a VIZIO apart needs the description XML's <manufacturer>,
+# which is enrichment this driver does not do yet. Setup asks for the address by hand instead
+# of guessing wrong silently.
