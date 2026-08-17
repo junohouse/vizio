@@ -55,10 +55,30 @@
 //! other request presents in an `AUTH` header, and it is issued once, by pairing, not
 //! discovered or guessed.
 //!
-//! # No app launching
+//! # Apps: it can launch them, it cannot list them
 //!
-//! There is no local endpoint that lists installed apps — VIZIO's own remote gets that from a
-//! cloud catalog keyed by ids this driver has no verified copy of. Left out rather than guessed.
+//! `PUT /app/launch` takes `{"VALUE": {NAME_SPACE, APP_ID, MESSAGE}}` and works locally like
+//! every other call here. What SmartCast has no local endpoint for is the *list*: VIZIO's own
+//! remote reads that from a cloud catalog, so this set can be told to open Netflix and can never
+//! be asked what it has.
+//!
+//! Which is why nothing is hardcoded below. Core hands the payload over as `launch_id`, from the
+//! catalog at <https://github.com/junohouse/apps>, and it is passed to the television **verbatim**
+//! — this driver does not parse it, does not rebuild it, and has no table of its own. Three
+//! reasons, and the third is the one that decided it:
+//!
+//! 1. The values are VIZIO's, published at `scfs.vizio.com/appservice/app_availability_prod.json`,
+//!    and they change when VIZIO changes them. A correction is a pull request, not a release.
+//! 2. `MESSAGE` is not decoration. Pluto TV's carries a nested Cast payload and Fandango's a URL,
+//!    so anything that reduced this to a namespace and an id would break those two silently.
+//! 3. A wrong id opens the wrong app — or nothing — and reports success either way. That failure
+//!    is invisible from the sofa, so the ids must be ones somebody can check against VIZIO's own
+//!    file rather than ones a driver author remembered.
+//!
+//! One known gap: Prime Video's payload differs by chipset — VIZIO's default says `NAME_SPACE 2,
+//! APP_ID 4`, and five newer MediaTek panels say `NAME_SPACE 3, APP_ID 3`. The catalog carries one
+//! value per app and holds the default, so Prime Video may not open on a recent set. There is no
+//! local way to read the chipset, so this is recorded rather than solved.
 
 use driver_sdk::*;
 use driver_sdk::Value;
@@ -260,6 +280,38 @@ impl DriverModule for Vizio {
         }
         if Self::auth(inst).is_none() {
             return vec![HostCall::warn("vizio: this TV is not paired yet — run its setup flow")];
+        }
+
+        // --- launching an app -------------------------------------------------------------
+        //
+        // `launch_id` is the whole thing: VIZIO's own `app_type_payload`, handed over by core
+        // from the shared catalog, and sent back to the set as the body of `PUT /app/launch`
+        // unchanged. This driver never parses it — see the module header for why that matters.
+        if cmd == "launch_app" {
+            let Some(app) = args.get("app").and_then(Value::as_str) else {
+                return vec![HostCall::warn("vizio: launch_app needs an app name")];
+            };
+            let Some(payload) = args.get("launch_id").and_then(Value::as_str) else {
+                // The catalog has no row for it. Saying so precisely is the difference between
+                // somebody adding one line to a public file and somebody filing a driver bug.
+                return vec![HostCall::warn(format!(
+                    "vizio: no VIZIO app id for `{app}`. This set cannot list what it has \
+                     installed, so the id has to come from the catalog — add it at \
+                     https://github.com/junohouse/apps"
+                ))];
+            };
+            let Ok(value) = serde_json::from_str::<Value>(payload) else {
+                return vec![HostCall::warn(format!(
+                    "vizio: the catalog's entry for `{app}` is not valid JSON"
+                ))];
+            };
+
+            let mut a = Args::new();
+            a.insert("app".into(), Value::from(app));
+            return Self::put(inst, "/app/launch", json!({ "VALUE": value }))
+                .into_iter()
+                .chain(std::iter::once(HostCall::notify(MEDIA, "app_changed", a)))
+                .collect();
         }
 
         let key = match (proxy, cmd) {
@@ -643,6 +695,72 @@ mod tests {
         let body: Value = serde_json::from_str(req.body.as_deref().unwrap()).unwrap();
         assert_eq!(body["KEYLIST"][0]["CODESET"], 11);
         assert_eq!(body["KEYLIST"][0]["CODE"], 1);
+    }
+
+    /// The payload goes to the television exactly as the catalog holds it.
+    ///
+    /// Not rebuilt from parts, and that is the test. `MESSAGE` carries a nested Cast blob for
+    /// Pluto and a URL for Fandango, so anything that took this apart into a namespace and an id
+    /// would drop those and open a home screen while reporting success.
+    #[test]
+    fn a_catalog_payload_is_sent_to_the_set_untouched() {
+        let driver = Vizio;
+        let mut inst = paired();
+        let mut args = Args::new();
+        args.insert("app".into(), json!("Netflix"));
+        args.insert(
+            "launch_id".into(),
+            json!(r#"{"NAME_SPACE":3,"APP_ID":"1","MESSAGE":null}"#),
+        );
+
+        let calls = driver.on_command(&mut inst, MEDIA, "launch_app", &args);
+        let [HostCall::Http(req), HostCall::Notify { .. }] = calls.as_slice() else {
+            panic!("expected an http call and a notify, got {calls:?}");
+        };
+        assert!(req.url.ends_with("/app/launch"));
+        assert!(req.headers.iter().any(|(k, v)| k == "AUTH" && v == "tok"));
+        let body: Value = serde_json::from_str(req.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["VALUE"]["NAME_SPACE"], 3);
+        assert_eq!(body["VALUE"]["APP_ID"], "1");
+        assert!(body["VALUE"]["MESSAGE"].is_null());
+    }
+
+    /// A `MESSAGE` that is itself a document survives, because it is never looked at.
+    #[test]
+    fn a_message_payload_survives_whole() {
+        let driver = Vizio;
+        let mut inst = paired();
+        let mut args = Args::new();
+        args.insert("app".into(), json!("Pluto TV"));
+        args.insert(
+            "launch_id".into(),
+            json!(r#"{"NAME_SPACE":0,"APP_ID":"E6F74C01","MESSAGE":{"CAST_NAMESPACE":"urn:x-cast:tv.pluto"}}"#),
+        );
+
+        let calls = driver.on_command(&mut inst, MEDIA, "launch_app", &args);
+        let [HostCall::Http(req), ..] = calls.as_slice() else {
+            panic!("expected an http call, got {calls:?}");
+        };
+        let body: Value = serde_json::from_str(req.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["VALUE"]["MESSAGE"]["CAST_NAMESPACE"], "urn:x-cast:tv.pluto");
+    }
+
+    /// No id means say so, not send something. This set cannot be asked what it has, so an app
+    /// the catalog has never heard of has nowhere else to come from — and a silent no-op here
+    /// would look exactly like a television that ignored the remote.
+    #[test]
+    fn an_app_the_catalog_does_not_know_is_refused_out_loud() {
+        let driver = Vizio;
+        let mut inst = paired();
+        let mut args = Args::new();
+        args.insert("app".into(), json!("Some Regional Broadcaster"));
+
+        let calls = driver.on_command(&mut inst, MEDIA, "launch_app", &args);
+        let [HostCall::Log { level, msg }] = calls.as_slice() else {
+            panic!("expected one warning, got {calls:?}");
+        };
+        assert_eq!(level, "warn");
+        assert!(msg.contains("junohouse/apps"), "say where to fix it: {msg}");
     }
 
     fn current_input(name: &str, hashval: i64) -> Args {
