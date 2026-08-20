@@ -506,37 +506,66 @@ impl Vizio {
                 // from Discovery arrives with its address known — see `SurveyCache::seed_for`.
                 // The field stays, because multicast is blocked on plenty of networks and
                 // typing it in is still the fallback; it just starts filled in.
-                let found = state
+                let candidate = state
                     .get("mdns_candidates")
                     .and_then(Value::as_array)
-                    .and_then(|all| all.first())
+                    .and_then(|all| all.first());
+                let found = candidate
                     .and_then(|c| c.get("address"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                // What the set calls itself. A television announces the name somebody gave it
+                // when they set it up — "Living Room" — and that is a better name for it in the
+                // tree than the model with an IP address after it.
+                let found_name = candidate
+                    .and_then(|c| c.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
+                // Found on the network: there is nothing to ask. An address is not how this
+                // television is identified — DHCP hands it a different one whenever it feels
+                // like it — so showing a form to confirm a number nobody chose and nobody
+                // should have to keep is asking somebody to pin a lease.
+                if let Some(address) = found {
+                    return (
+                        SetupStep::Fetch {
+                            request: HttpRequest::new(
+                                "PUT",
+                                format!("https://{address}:7345/pairing/start"),
+                            )
+                            .json(
+                                json!({ "DEVICE_ID": DEVICE_ID, "DEVICE_NAME": DEVICE_NAME })
+                                    .to_string(),
+                            ),
+                            note: "asking the TV to show a pairing code".into(),
+                        },
+                        json!({
+                            "phase": "started", "address": address,
+                            "found_name": found_name,
+                        }),
+                    );
+                }
                 (
                     SetupStep::Form {
                         title: "Add a VIZIO TV".into(),
-                        body: if found.is_some() {
-                            "The next screen asks for a code the TV shows once this reaches it, \
-                             so leave the set on and pointed at that screen."
-                                .into()
-                        } else {
-                            "Its address is on the TV: Settings → Network → Network Connection. \
-                             The next screen asks for a code the TV shows once this reaches it, \
-                             so leave the set on and pointed at that screen."
-                                .to_string()
-                        },
+                        // Only reached when nothing found it — multicast blocked, a different
+                        // VLAN. Typing it in still works, and still wants a reservation.
+                        body: "Its address is on the TV: Settings → Network → Network \
+                               Connection. The next screen asks for a code the TV shows once \
+                               this reaches it, so leave the set on and pointed at that screen."
+                            .into(),
                         fields: vec![Field {
                             name: "address".into(),
                             label: "Address".into(),
                             kind: "string".into(),
                             help: "for example 192.168.1.42".into(),
-                            default: found.map(Value::String),
+                            default: None,
                             options: Vec::new(),
                             required: true,
                         }],
                     },
-                    json!({ "phase": "entered" }),
+                    json!({ "phase": "entered", "found_name": found_name }),
                 )
             }
 
@@ -558,7 +587,10 @@ impl Vizio {
                         .json(json!({ "DEVICE_ID": DEVICE_ID, "DEVICE_NAME": DEVICE_NAME }).to_string()),
                         note: "asking the TV to show a pairing code".into(),
                     },
-                    json!({ "phase": "started", "address": address }),
+                    json!({
+                        "phase": "started", "address": address,
+                        "found_name": state.get("found_name"),
+                    }),
                 )
             }
 
@@ -597,6 +629,7 @@ impl Vizio {
                     json!({
                         "phase": "coded", "address": address,
                         "req_token": token, "challenge_type": challenge,
+                        "found_name": state.get("found_name"),
                     }),
                 )
             }
@@ -626,7 +659,10 @@ impl Vizio {
                         ),
                         note: "checking the code".into(),
                     },
-                    json!({ "phase": "paired", "address": address }),
+                    json!({
+                        "phase": "paired", "address": address,
+                        "found_name": state.get("found_name"),
+                    }),
                 )
             }
 
@@ -649,7 +685,15 @@ impl Vizio {
                         title: "Add this TV".into(),
                         body: "Paired.".into(),
                         options: vec![Candidate {
-                            label: format!("VIZIO TV ({address})"),
+                            // What the set calls itself, which is what somebody named it when
+                            // they set the television up. The model with an IP after it is a
+                            // last resort, not a default: nobody has two televisions they tell
+                            // apart by address.
+                            label: state
+                                .get("found_name")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("VIZIO TV ({address})")),
                             kind: "VIZIO TV".into(),
                             driver_id: "vizio.tv".into(),
                             properties: [
@@ -692,18 +736,78 @@ mod seeded_tests {
         Vizio.setup("vizio.tv", &state, &Args::new()).0
     }
 
-    /// Added from Discovery, which already found the set. Asking for an address that is on
-    /// screen two panels away is the wizard not being told what the pane knew.
+    /// Found on the network: no form at all.
+    ///
+    /// An address is not how a television is identified — DHCP hands it a different one
+    /// whenever it likes — so asking somebody to confirm a number nobody chose is asking them
+    /// to go and pin a lease. It goes straight to the pairing request.
     #[test]
-    fn a_set_found_on_the_network_starts_with_its_address() {
+    fn a_set_found_on_the_network_is_never_asked_for_its_address() {
         let step = start(json!({
             "mdns_candidates": [{ "address": "192.168.1.175", "service": "_viziocast._tcp" }]
         }));
-        let SetupStep::Form { fields, .. } = step else { panic!("expected a form, got {step:?}") };
-        assert_eq!(
-            fields[0].default.as_ref().and_then(Value::as_str),
-            Some("192.168.1.175"),
+        let SetupStep::Fetch { request, .. } = step else {
+            panic!("expected the pairing request, got {step:?}")
+        };
+        assert!(request.url.starts_with("https://192.168.1.175:7345/pairing/start"), "{}", request.url);
+    }
+
+    /// The set is named after itself, all the way through pairing.
+    #[test]
+    fn a_discovered_set_is_named_what_it_calls_itself() {
+        let seed = json!({
+            "mdns_candidates": [{ "address": "192.168.1.175", "name": "Living Room" }]
+        });
+        // Straight to the pairing request; nothing is asked.
+        let (_, state) = Vizio.discover("vizio.tv", &seed, &Args::new());
+
+        let mut started = Args::new();
+        started.insert("status".into(), json!(200));
+        started.insert(
+            "response".into(),
+            json!({ "ITEM": { "PAIRING_REQ_TOKEN": 1, "CHALLENGE_TYPE": 1 } }),
         );
+        let (_, state) = Vizio.setup("vizio.tv", &state, &started);
+
+        let mut pin = Args::new();
+        pin.insert("pin".into(), json!("1234"));
+        let (_, state) = Vizio.setup("vizio.tv", &state, &pin);
+
+        let mut paired = Args::new();
+        paired.insert("status".into(), json!(200));
+        paired.insert("response".into(), json!({ "ITEM": { "AUTH_TOKEN": "tok" } }));
+        let (step, _) = Vizio.setup("vizio.tv", &state, &paired);
+
+        let SetupStep::Choose { options, .. } = step else { panic!("expected a choice: {step:?}") };
+        assert_eq!(
+            options[0].label, "Living Room",
+            "the name it announces, not the model with an address after it",
+        );
+    }
+
+    /// Typed in by hand, so nothing announced a name. The model and address is the fallback.
+    #[test]
+    fn a_set_nobody_found_still_gets_a_usable_name() {
+        let (_, state) = Vizio.discover("vizio.tv", &json!({}), &Args::new());
+        let mut address = Args::new();
+        address.insert("address".into(), json!("10.0.0.5"));
+        let (_, state) = Vizio.setup("vizio.tv", &state, &address);
+        let mut started = Args::new();
+        started.insert("status".into(), json!(200));
+        started.insert(
+            "response".into(),
+            json!({ "ITEM": { "PAIRING_REQ_TOKEN": 1, "CHALLENGE_TYPE": 1 } }),
+        );
+        let (_, state) = Vizio.setup("vizio.tv", &state, &started);
+        let mut pin = Args::new();
+        pin.insert("pin".into(), json!("1234"));
+        let (_, state) = Vizio.setup("vizio.tv", &state, &pin);
+        let mut paired = Args::new();
+        paired.insert("status".into(), json!(200));
+        paired.insert("response".into(), json!({ "ITEM": { "AUTH_TOKEN": "tok" } }));
+        let (step, _) = Vizio.setup("vizio.tv", &state, &paired);
+        let SetupStep::Choose { options, .. } = step else { panic!("expected a choice") };
+        assert_eq!(options[0].label, "VIZIO TV (10.0.0.5)");
     }
 
     /// Multicast is blocked on plenty of networks, and typing it in is still the way through.
