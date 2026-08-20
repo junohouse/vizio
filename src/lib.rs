@@ -393,7 +393,7 @@ impl DriverModule for Vizio {
                 a.insert("on".into(), json!(cmd == "on"));
                 out.push(HostCall::notify(TV, "power_changed", a));
             }
-            // power_toggle, volume_up/down, mute_toggle: no optimistic notify. Which way a
+            // power_toggle, volume_up/down, mute_toggle: no optimiztic notify. Which way a
             // toggle just went, or where the level landed, is a guess this driver is not in a
             // better position to make than reading the TV back.
             _ => {}
