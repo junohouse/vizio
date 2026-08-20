@@ -602,12 +602,47 @@ impl Vizio {
                     item.and_then(|i| i.get("PAIRING_REQ_TOKEN")).and_then(Value::as_i64),
                     item.and_then(|i| i.get("CHALLENGE_TYPE")).and_then(Value::as_i64),
                 ) else {
+                    let result = response
+                        .pointer("/STATUS/RESULT")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_uppercase();
+                    // The set refuses a second pairing while one is still open, and one stays
+                    // open after a code is typed wrongly. Measured on a V505-H9: `/pairing/start`
+                    // answers `{"STATUS":{"RESULT":"BLOCKED"}}` until the pending one times out
+                    // — about half a minute — and then succeeds.
+                    //
+                    // This used to report "did not answer as a VIZIO SmartCast TV. Check the
+                    // address", which is untrue, unactionable, and a dead end: the set was
+                    // answering, at the right address, and every retry said the same thing. It
+                    // is a wait, so it waits.
+                    if result == "BLOCKED" {
+                        return (
+                            SetupStep::Wait {
+                                title: "The TV is still showing an earlier code".into(),
+                                body: "It will not start a second pairing until that one times \
+                                       out. Waiting for it — nothing to do."
+                                    .into(),
+                                retry_ms: 5_000,
+                            },
+                            json!({
+                                "phase": "entered", "address": address,
+                                "found_name": state.get("found_name"),
+                            }),
+                        );
+                    }
                     return (
                         SetupStep::Failed {
-                            reason: format!(
-                                "{address} did not answer as a VIZIO SmartCast TV. Check the \
-                                 address under Settings → Network → Network Connection."
-                            ),
+                            reason: if result.is_empty() {
+                                format!(
+                                    "{address} did not answer as a VIZIO SmartCast TV. Check \
+                                     the address under Settings → Network → Network Connection."
+                                )
+                            } else {
+                                // Its own word for it. A driver inventing a friendlier reason
+                                // is a driver hiding the one string somebody can search for.
+                                format!("the TV refused to start pairing: {result}")
+                            },
                         },
                         Value::Null,
                     );
@@ -661,6 +696,7 @@ impl Vizio {
                     },
                     json!({
                         "phase": "paired", "address": address,
+                        "req_token": req_token, "challenge_type": challenge,
                         "found_name": state.get("found_name"),
                     }),
                 )
@@ -671,13 +707,38 @@ impl Vizio {
                 let response = input.get("response").cloned().unwrap_or(Value::Null);
                 let Some(token) = response.get("ITEM").and_then(|i| i.get("AUTH_TOKEN")).and_then(Value::as_str)
                 else {
+                    // A wrong code is not the end of the flow — it is a typo. But the set keeps
+                    // the pairing it started, and refuses to open another while it stands, so
+                    // simply saying "start over" left somebody pressing Add against a `BLOCKED`
+                    // that lasted until the code on screen timed out.
+                    //
+                    // Hand it back its own session to cancel, then begin again for a fresh
+                    // code. Cancelling with a token it does not recognise answers `SUCCESS` and
+                    // clears nothing, which is why this waits for the response rather than
+                    // firing and hoping.
+                    let req_token = state.get("req_token").and_then(Value::as_i64).unwrap_or(0);
+                    let challenge = state.get("challenge_type").and_then(Value::as_i64).unwrap_or(1);
                     return (
-                        SetupStep::Failed {
-                            reason: "that code was not accepted. Start over and check the TV \
-                                     screen for a fresh one."
-                                .into(),
+                        SetupStep::Fetch {
+                            request: HttpRequest::new(
+                                "PUT",
+                                format!("https://{address}:7345/pairing/cancel"),
+                            )
+                            .json(
+                                json!({
+                                    "DEVICE_ID": DEVICE_ID,
+                                    "CHALLENGE_TYPE": challenge,
+                                    "RESPONSE_VALUE": "1111",
+                                    "PAIRING_REQ_TOKEN": req_token,
+                                })
+                                .to_string(),
+                            ),
+                            note: "that code was not accepted — clearing it to try again".into(),
                         },
-                        Value::Null,
+                        json!({
+                            "phase": "entered", "address": address,
+                            "found_name": state.get("found_name"),
+                        }),
                     );
                 };
                 (
@@ -808,6 +869,76 @@ mod seeded_tests {
         let (step, _) = Vizio.setup("vizio.tv", &state, &paired);
         let SetupStep::Choose { options, .. } = step else { panic!("expected a choice") };
         assert_eq!(options[0].label, "VIZIO TV (10.0.0.5)");
+    }
+
+    /// A set that already has a code on screen is a wait, not a failure.
+    ///
+    /// Measured on a V505-H9: after a code is typed wrongly the pairing stays open, and
+    /// `/pairing/start` answers `{"STATUS":{"RESULT":"BLOCKED"}}` until it times out. This used
+    /// to be reported as "did not answer as a VIZIO SmartCast TV. Check the address" — untrue,
+    /// unactionable, and identical on every retry.
+    #[test]
+    fn a_blocked_pairing_waits_rather_than_failing() {
+        let (_, state) = Vizio.discover(
+            "vizio.tv",
+            &json!({ "mdns_candidates": [{ "address": "192.168.1.175", "name": "Living Room" }] }),
+            &Args::new(),
+        );
+        let mut blocked = Args::new();
+        blocked.insert("status".into(), json!(200));
+        blocked.insert(
+            "response".into(),
+            json!({ "STATUS": { "RESULT": "BLOCKED", "DETAIL": "Operation blocked" } }),
+        );
+        let (step, next) = Vizio.setup("vizio.tv", &state, &blocked);
+
+        assert!(matches!(step, SetupStep::Wait { .. }), "expected a wait, got {step:?}");
+        assert_eq!(
+            next.get("phase").and_then(Value::as_str),
+            Some("entered"),
+            "and the next turn asks the set again, rather than needing somebody to start over",
+        );
+        assert_eq!(next.get("address").and_then(Value::as_str), Some("192.168.1.175"));
+    }
+
+    /// Anything else it refuses is reported in its own words.
+    #[test]
+    fn another_refusal_is_reported_as_the_set_worded_it() {
+        let (_, state) = Vizio.discover(
+            "vizio.tv",
+            &json!({ "mdns_candidates": [{ "address": "10.0.0.5" }] }),
+            &Args::new(),
+        );
+        let mut denied = Args::new();
+        denied.insert("status".into(), json!(200));
+        denied.insert("response".into(), json!({ "STATUS": { "RESULT": "MAX_CHALLENGES_EXCEEDED" } }));
+        let (step, _) = Vizio.setup("vizio.tv", &state, &denied);
+        let SetupStep::Failed { reason } = step else { panic!("expected a failure: {step:?}") };
+        assert!(reason.contains("MAX_CHALLENGES_EXCEEDED"), "{reason}");
+    }
+
+    /// A wrong code cancels the session it belongs to and starts again, rather than leaving the
+    /// set blocked and telling somebody to start over into that block.
+    #[test]
+    fn a_wrong_code_clears_the_pairing_and_retries() {
+        let state = json!({
+            "phase": "paired", "address": "192.168.1.175",
+            "req_token": 4242, "challenge_type": 1,
+        });
+        let mut refused = Args::new();
+        refused.insert("status".into(), json!(200));
+        refused.insert("response".into(), json!({ "STATUS": { "RESULT": "INVALID_PARAMETER" } }));
+        let (step, next) = Vizio.setup("vizio.tv", &state, &refused);
+
+        let SetupStep::Fetch { request, .. } = step else { panic!("expected a cancel: {step:?}") };
+        assert!(request.url.ends_with("/pairing/cancel"), "{}", request.url);
+        let body = request.body.clone().unwrap_or_default();
+        assert!(
+            body.contains("4242"),
+            "cancel has to name the session it is cancelling — a token the set does not \
+             recognise answers SUCCESS and clears nothing: {body}",
+        );
+        assert_eq!(next.get("phase").and_then(Value::as_str), Some("entered"));
     }
 
     /// Multicast is blocked on plenty of networks, and typing it in is still the way through.
