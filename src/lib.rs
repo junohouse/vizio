@@ -500,6 +500,15 @@ impl DriverModule for Vizio {
 impl Vizio {
     fn flow(&self, state: &Value, input: &Args) -> (SetupStep, Value) {
         let phase = state.get("phase").and_then(Value::as_str).unwrap_or("start");
+        // The set's address, from whichever side knows it. Somebody typing it in puts it in
+        // `input`; a set found on the network — or a pairing being started again after a wrong
+        // code — carries it in `state`.
+        let address = state
+            .get("address")
+            .and_then(Value::as_str)
+            .or_else(|| input.get("address").and_then(Value::as_str))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         match phase {
             "start" => {
                 // Core hands over whatever the survey already found, so a set that was added
@@ -570,14 +579,16 @@ impl Vizio {
             }
 
             "entered" => {
-                let address =
-                    input.get("address").and_then(Value::as_str).unwrap_or_default().trim().to_string();
-                if address.is_empty() {
+                // Whichever knows it. Somebody typing it in puts it in `input`; a set found on
+                // the network, or a pairing being started again after a wrong code, carries it
+                // in `state` — and reading only `input` made the retry fail with "an address is
+                // needed" about a television whose address had never been in doubt.
+                let Some(address) = address.clone() else {
                     return (
                         SetupStep::Failed { reason: "an address is needed".into() },
                         Value::Null,
                     );
-                }
+                };
                 (
                     SetupStep::Fetch {
                         request: HttpRequest::new(
@@ -741,34 +752,32 @@ impl Vizio {
                         }),
                     );
                 };
+                // Straight to adding it. There was a screen here offering one television and
+                // asking which to add — after somebody had pressed Add on it, watched it come
+                // up on the set, and typed the code off the screen. Three deliberate acts
+                // naming the same television, and then a question about which one they meant.
                 (
-                    SetupStep::Choose {
-                        title: "Add this TV".into(),
-                        body: "Paired.".into(),
-                        options: vec![Candidate {
-                            // What the set calls itself, which is what somebody named it when
-                            // they set the television up. The model with an IP after it is a
-                            // last resort, not a default: nobody has two televisions they tell
-                            // apart by address.
-                            label: state
-                                .get("found_name")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| format!("VIZIO TV ({address})")),
-                            kind: "VIZIO TV".into(),
-                            driver_id: "vizio.tv".into(),
-                            properties: [
-                                ("Address".to_string(), json!(address)),
-                                ("Auth Token".to_string(), json!(token)),
-                            ]
-                            .into_iter()
-                            .collect(),
-                            verified: "paired and holding an auth token".into(),
-                            ..Default::default()
-                        }],
-                        multiple: false,
-                    },
-                    json!({ "phase": "chosen" }),
+                    SetupStep::done(vec![Candidate {
+                        // What the set calls itself, which is what somebody named it when they
+                        // set the television up. The model with an IP after it is a last
+                        // resort: nobody has two televisions they tell apart by address.
+                        label: state
+                            .get("found_name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("VIZIO TV ({address})")),
+                        kind: "VIZIO TV".into(),
+                        driver_id: "vizio.tv".into(),
+                        properties: [
+                            ("Address".to_string(), json!(address)),
+                            ("Auth Token".to_string(), json!(token)),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        verified: "paired and holding an auth token".into(),
+                        ..Default::default()
+                    }]),
+                    Value::Null,
                 )
             }
 
@@ -839,9 +848,11 @@ mod seeded_tests {
         paired.insert("response".into(), json!({ "ITEM": { "AUTH_TOKEN": "tok" } }));
         let (step, _) = Vizio.setup("vizio.tv", &state, &paired);
 
-        let SetupStep::Choose { options, .. } = step else { panic!("expected a choice: {step:?}") };
+        // Straight to adding it — no screen asking which television, after three deliberate
+        // acts naming the same one.
+        let SetupStep::Done { devices, .. } = step else { panic!("expected done: {step:?}") };
         assert_eq!(
-            options[0].label, "Living Room",
+            devices[0].label, "Living Room",
             "the name it announces, not the model with an address after it",
         );
     }
@@ -867,8 +878,8 @@ mod seeded_tests {
         paired.insert("status".into(), json!(200));
         paired.insert("response".into(), json!({ "ITEM": { "AUTH_TOKEN": "tok" } }));
         let (step, _) = Vizio.setup("vizio.tv", &state, &paired);
-        let SetupStep::Choose { options, .. } = step else { panic!("expected a choice") };
-        assert_eq!(options[0].label, "VIZIO TV (10.0.0.5)");
+        let SetupStep::Done { devices, .. } = step else { panic!("expected done: {step:?}") };
+        assert_eq!(devices[0].label, "VIZIO TV (10.0.0.5)");
     }
 
     /// A set that already has a code on screen is a wait, not a failure.
@@ -899,6 +910,28 @@ mod seeded_tests {
             "and the next turn asks the set again, rather than needing somebody to start over",
         );
         assert_eq!(next.get("address").and_then(Value::as_str), Some("192.168.1.175"));
+    }
+
+    /// A wrong code sends the flow back to start again — and the address it needs is the one it
+    /// already had. Reading it only out of `input` made that retry fail with "an address is
+    /// needed" about a television whose address had never been in doubt.
+    #[test]
+    fn starting_again_after_a_wrong_code_still_knows_the_address() {
+        // What the cancel step hands back: phase `entered`, address in state, nothing in input
+        // but the response to the cancel.
+        let state = json!({ "phase": "entered", "address": "192.168.1.175" });
+        let mut after_cancel = Args::new();
+        after_cancel.insert("status".into(), json!(200));
+        after_cancel.insert("response".into(), json!({ "STATUS": { "RESULT": "SUCCESS" } }));
+
+        let (step, _) = Vizio.setup("vizio.tv", &state, &after_cancel);
+        let SetupStep::Fetch { request, .. } = step else {
+            panic!("expected the pairing request again, got {step:?}")
+        };
+        assert!(
+            request.url.starts_with("https://192.168.1.175:7345/pairing/start"),
+            "{}", request.url,
+        );
     }
 
     /// Anything else it refuses is reported in its own words.
