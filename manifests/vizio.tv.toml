@@ -75,8 +75,19 @@ name = "Auth Token"
 type = "password"
 tooltip = "Issued by pairing — do not edit by hand."
 
-# No [discovery]: DIAL SSDP (urn:dial-multiscreen-org:device:dial:1) and mDNS
-# (_viziocast._tcp) both exist for this, but the SSDP type is shared with every DIAL-capable
-# TV — Roku included — and telling a VIZIO apart needs the description XML's <manufacturer>,
-# which is enrichment this driver does not do yet. Setup asks for the address by hand instead
-# of guessing wrong silently.
+# DIAL SSDP (`urn:dial-multiscreen-org:device:dial:1`) is still not declared, and for the
+# original reason: it is shared with every DIAL-capable TV — Roku included — and telling a
+# VIZIO apart through it needs the description XML's <manufacturer>, which is enrichment this
+# driver does not do.
+#
+# The two below need no enrichment. `_viziocast._tcp` is VIZIO's own service and nothing else
+# advertises it. `_airplay._tcp` is shared with every AirPlay 2 receiver, but a VIZIO says so
+# in its TXT — measured on a V505-H9: `manufacturer=VIZIO Inc.`, `model=V505-H9`, beside a
+# Hisense Roku on the same network sending `manufacturer=Hisense`. That is exactly the
+# manufacturer check the DIAL note wanted, arriving in the announcement instead of needing a
+# second request.
+[discovery]
+mdns = [
+  "_viziocast._tcp",
+  { service = "_airplay._tcp", txt = { manufacturer = "VIZIO*" } },
+]
