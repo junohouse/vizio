@@ -501,25 +501,44 @@ impl Vizio {
     fn flow(&self, state: &Value, input: &Args) -> (SetupStep, Value) {
         let phase = state.get("phase").and_then(Value::as_str).unwrap_or("start");
         match phase {
-            "start" => (
-                SetupStep::Form {
-                    title: "Add a VIZIO TV".into(),
-                    body: "Its address is on the TV: Settings → Network → Network Connection. \
-                           The next screen will ask for a code the TV shows once this reaches \
-                           it, so leave the TV on and pointed at that screen."
-                        .into(),
-                    fields: vec![Field {
-                        name: "address".into(),
-                        label: "Address".into(),
-                        kind: "string".into(),
-                        help: "for example 192.168.1.42".into(),
-                        default: None,
-                        options: Vec::new(),
-                        required: true,
-                    }],
-                },
-                json!({ "phase": "entered" }),
-            ),
+            "start" => {
+                // Core hands over whatever the survey already found, so a set that was added
+                // from Discovery arrives with its address known — see `SurveyCache::seed_for`.
+                // The field stays, because multicast is blocked on plenty of networks and
+                // typing it in is still the fallback; it just starts filled in.
+                let found = state
+                    .get("mdns_candidates")
+                    .and_then(Value::as_array)
+                    .and_then(|all| all.first())
+                    .and_then(|c| c.get("address"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                (
+                    SetupStep::Form {
+                        title: "Add a VIZIO TV".into(),
+                        body: if found.is_some() {
+                            "The next screen asks for a code the TV shows once this reaches it, \
+                             so leave the set on and pointed at that screen."
+                                .into()
+                        } else {
+                            "Its address is on the TV: Settings → Network → Network Connection. \
+                             The next screen asks for a code the TV shows once this reaches it, \
+                             so leave the set on and pointed at that screen."
+                                .to_string()
+                        },
+                        fields: vec![Field {
+                            name: "address".into(),
+                            label: "Address".into(),
+                            kind: "string".into(),
+                            help: "for example 192.168.1.42".into(),
+                            default: found.map(Value::String),
+                            options: Vec::new(),
+                            required: true,
+                        }],
+                    },
+                    json!({ "phase": "entered" }),
+                )
+            }
 
             "entered" => {
                 let address =
@@ -664,6 +683,37 @@ impl Vizio {
     }
 }
 
+
+#[cfg(test)]
+mod seeded_tests {
+    use super::*;
+
+    fn start(state: Value) -> SetupStep {
+        Vizio.setup("vizio.tv", &state, &Args::new()).0
+    }
+
+    /// Added from Discovery, which already found the set. Asking for an address that is on
+    /// screen two panels away is the wizard not being told what the pane knew.
+    #[test]
+    fn a_set_found_on_the_network_starts_with_its_address() {
+        let step = start(json!({
+            "mdns_candidates": [{ "address": "192.168.1.175", "service": "_viziocast._tcp" }]
+        }));
+        let SetupStep::Form { fields, .. } = step else { panic!("expected a form, got {step:?}") };
+        assert_eq!(
+            fields[0].default.as_ref().and_then(Value::as_str),
+            Some("192.168.1.175"),
+        );
+    }
+
+    /// Multicast is blocked on plenty of networks, and typing it in is still the way through.
+    #[test]
+    fn a_set_nobody_found_still_asks() {
+        let step = start(json!({}));
+        let SetupStep::Form { fields, .. } = step else { panic!("expected a form") };
+        assert!(fields[0].default.is_none());
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
